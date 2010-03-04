@@ -1,0 +1,242 @@
+#!/usr/bin/perl -w
+# (c) Федор Зуев, fedor@earth.crust.irk.ru
+# распространение приветствуется, на условиях GNU GPL :-)
+use XML::Simple;
+use IO::Uncompress::Unzip;
+use Digest::CRC;
+use Date::Manip;
+use Data::Dumper;
+use Getopt::Std;
+use File::Copy;
+use File::LibMagic ':easy';
+
+$|=1;
+getopts "yqvd:m:",\%opts;
+$movedir="/archive/books/fbdoubles/";
+$movedir=$opts{m} if $opts{m};
+$workdir="/archive/books/fb/";
+$workdir=$opts{d} if $opts{d};
+
+sub rmbook($$) {
+    my $reason=$_[0];
+    my $file=$_[1];
+    print $reason."\nrm ".$file."\n\n" unless $opts{q};
+    if($opts{m}){
+	move($file, $movedir);
+    } elsif($opts{y}){
+	unlink $file;
+    } 
+};
+
+sub HELP_MESSAGE(){
+    print "fb2dupes.byid - delete duplicate files using ID\n";
+    print "\t-y\tyes, really delete\n";
+    print "\t-q\tsupress some messages\n";
+    print "\t-v\tshow process state\n";
+    print "\t-d<dir>\troot directory\n";
+    print "\t-m<dir>\tmove, not delete\n";
+    exit;
+};
+
+
+open(BOOKLIST,"find ${workdir}   -type f -iname '*.fb2' -o -iname '*fb2*.zip'|");
+my $holdcr = $/; 
+while (<BOOKLIST>)
+{
+    chomp;
+    $brokenbody=0;
+    $zipfile=$_;
+    print "$zipfile\n" if $opts{v};
+    $magic=MagicFile($zipfile);
+    if($magic =~/Zip archive/)
+    {
+# *** get file attributes
+	$fbfile = new IO::Uncompress::Unzip $zipfile;
+	$size= $fbfile->getHeaderInfo()->{UncompressedLength}[0];
+	$timestamp=$fbfile->getHeaderInfo()->{Time};
+	close $fbfile;
+	IO::Uncompress::Unzip::unzip $zipfile => \$fb;
+    } elsif ($magic=~/XML  document/){
+	open FILE, $zipfile;
+	undef $/; $fb=<FILE>; $/ = $holdcr;
+	close FILE;
+	($size,$timestamp)= (stat $zipfile)[7,9];
+    } else {
+	print "$zipfile:\nformat not implemented, skip\n";
+	next;
+    }
+# *** некоторая чистка
+    $fb=~tr[\000-\010\013\016-\035][ ];
+##война с лишними амперсандами
+    $fb=~s/&&/&amp;&amp;/g;
+    $fb=~s/&([^a-zA-Z#])/&amp;$1/g;
+    $fb=~s/&([^;]*[^a-zA-Z0-9#;])/&amp;$1/g;
+    $fb=~s/& /&amp; /g;
+## война с открывающими угловыми скобками
+   $fb=~s/<</&lt;&lt;/g;
+   $fb=~s/<([^>])</&lt$1</g;
+   $fb=~s/<([^\w\/\?])/&lt;$1/g;
+   $fb=~s/<>/&lt;&gt;/g;
+## пропущенные открывающие <p> 
+    $fb=~s|</p>([^<]*)</p>|<\/p><p>$1<\/p>|gm;
+# ***
+    $xml = eval{ XMLin($fb, NoAttr=>1,SuppressEmpty=>'')};
+    if ($@) { # XML parsing failed
+	$brokenbody=1;
+	$@=~s|at /usr/.*$||;
+	print "ERROR>$zipfile:".$@ unless $opts{q}; 
+	print "trying to process header only.." unless $opts{q};
+	$fb=~s|<body.*</body>|<body></body>|s;
+	$fb=~s|<binary .*</binary>||gs;
+	$xml = eval{ XMLin($fb, NoAttr=>1,SuppressEmpty=>'')};
+	if($@){
+	    $@=~s|at /usr/.*$||;
+	    print "..skip, XML error:".$@ unless $opts{q};
+	    next;
+	}
+	print "..ok\n" unless $opts{q};
+    }
+    $bodydigest=Digest::CRC::crc32(Dumper($xml->{body}));
+    next if !defined ($xml->{description});
+    $xml=$xml->{description};
+    next if !defined ($xml->{'title-info'});
+    next if !defined ($xml->{'document-info'});
+
+## бывают (редко) странные файлы с двумя частичными секциями 
+## document-info. Свертка их идет с потерей информации, но 
+## оно встречается так редко, что не стоит содержательного разбора.
+    $xml->{'document-info'}= {map %$_,@{$xml->{'document-info'}}} if 
+	(ref $xml->{'document-info'} eq  ARRAY);
+
+# **** get fictionbook attributes
+    $booktitle= $xml->{'title-info'}->{'book-title'};
+    $id       = $xml->{'document-info'}->{id};
+    $version  = $xml->{'document-info'}->{version};
+    $program  = $xml->{'document-info'}->{'program-used'};
+    $date     = Date::Manip::ParseDateString($xml->{'document-info'}->{date});
+    $date = Date::Manip::ParseDateString("01-01-1980") if ( $date eq "");
+
+# **** найден дубль
+    next if ! defined ($id);
+    if (exists $lib{$id} ) {
+	print "\nID:",$id,"\n" unless $opts{q};
+	print "1:".$lib{$id}->{file}."  v=".$lib{$id}->{version}.
+	    " d=".$lib{$id}->{date}." p=".$lib{$id}->{program}.
+	    " sz=".$lib{$id}->{size}." crc=".$lib{$id}->{bodydigest}."\n" 
+	    unless $opts{q};
+	print "2:${zipfile}  v=${version} d=${date}".
+	    " p=${program} sz=${size} crc=${bodydigest}\n" unless $opts{q};
+
+#librusec kit: возможны неуникальные id
+	if ( $id=~/\d \d{2}:\d{2}:\d{2} 20\d{2}$/ &&
+	     $booktitle ne $lib{$id}->{booktitle}){
+	    print "LibRusEc kit: duplicate ID, skip...\n" unless $opts{q};
+	    next;
+	};
+#короткий id. вероятно, неуникальный
+	if(length($id)<10 &&
+	   $booktitle ne $lib{$id}->{booktitle}){
+	    print "Short ID,skip...\n" unless $opts{q};
+	    next;
+	}
+#невалидные файлы - не имеет смысла хранить кроме как в крайнем случае.
+	if ($brokenbody && !$lib{$id}->{brokenbody}){
+	    rmbook("Invalid FB2 file:",$zipfile);
+	    next;
+	}
+	if (!$brokenbody && $lib{$id}->{brokenbody}){
+	    rmbook("Invalid FB2 file:",$lib{$id}->{file});
+	    next;
+	}
+#точная копия - в первом приближении
+	if  ( $size  == $lib{$id}->{size} &&
+	      $program eq $lib{$id}->{program} &&
+	      $version eq $lib{$id}->{version} &&
+	      $bodydigest eq $lib{$id}->{bodydigest}) {
+	    if ($zipfile=~/fb2[1-9]/){
+		rmbook("exact copy:",$zipfile);
+		next;
+	    } else {
+		rmbook("exact copy:",$lib{$id}->{file});
+		goto ENDOFRULES;
+	    }
+	};
+
+#librusec kit: как правило плохое качество
+	if ( $program eq "LibRusEc kit" &&
+	     $lib{$id}->{program} ne "LibRusEc kit" ){
+	    rmbook("Librusec:",$zipfile);
+	    next;
+	};
+	if ( $lib{$id}->{program} eq "LibRusEc kit" &&
+	     $program ne "LibRusEc kit") {
+	    rmbook("Librusec:",$lib{$id}->{file});
+	    goto ENDOFRULES;
+	};
+
+# нестандартные символы в заголовке - нафигнафиг
+	if($zipfile=~/[^[:graph:]]/ &&
+	   $lib{$id}->{file}!~/[^[:graph:]]/){
+	    rmbook("Bad characters in name:",$zipfile);
+	    next;
+	}
+
+	if($zipfile!~/[^[:graph:]]/ &&
+	   $lib{$id}->{file}=~/[^[:graph:]]/){
+	    rmbook("Bad characters in name:",$lib{$id}->{file});
+	    goto ENDOFRULES;
+	}
+# version control
+	if ( $version < $lib{$id}->{version} &&
+	     $date le $lib{$id}->{date}){
+	    rmbook("Version:",$zipfile);
+	    next;
+	};
+	if ( $version > $lib{$id}->{version} &&
+	     $date ge $lib{$id}->{date} ){
+	    rmbook("Version:",$lib{$id}->{file});
+	    goto ENDOFRULES;
+	};
+# заголовок подробнее остальное одинаково
+	if ($size < $lib{$id}->{size} &&
+	    !$brokenbody &&
+	    $bodydigest eq $lib{$id}->{bodydigest}){
+            rmbook("Metainformation only:",$zipfile);
+            next;
+	}
+	if ($size > $lib{$id}->{size} &&
+	    $bodydigest eq $lib{$id}->{bodydigest}){
+            rmbook("Metainformation only:",$lib{$id}->{file});
+            goto ENDOFRULES;
+	}
+
+# size and date 
+# если файл больше и записан позже, то он, вероятно, исправлен. 
+	if ( $timestamp > $lib{$id}->{timestamp} &&
+	     $date ge $lib{$id}->{date} &&
+	     $size > $lib{$id}->{size}){
+	    rmbook("Edited:",$lib{$id}->{file});
+	    goto ENDOFRULES;
+	};
+	if ( $timestamp < $lib{$id}->{timestamp} &&
+	     $date le $lib{$id}->{date} &&
+	     $size < $lib{$id}->{size}){
+	    rmbook("Edited:",$zipfile);
+	    next;
+	}
+
+    };
+  ENDOFRULES:
+    $lib{$id}={ file      => $zipfile,
+		size      => $size,
+		timestamp => $timestamp,
+		brokenbody=> $brokenbody,
+		booktitle => $booktitle,
+		version   => $version,
+		program   => $program,
+		date      => $date,
+		bodydigest=> $bodydigest
+    };
+}
+
+__END__

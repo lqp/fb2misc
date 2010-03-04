@@ -1,0 +1,3 @@
+#!/bin/bash
+MONO_EXTERNAL_ENCODINGS=KOI8-R
+mono /usr/local/lib/fb2fix/FB2Fix.exe --rename --lower --force --pattern:'[*NLA*\]*NL*\*NL* *NF* *BN*[(*SN* - *SII*)].fb2' --output:/archive/books/ --incversion- $@
