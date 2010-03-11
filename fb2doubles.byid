@@ -13,17 +13,17 @@ use File::LibMagic ':easy';
 $|=1;
 getopts "yqvd:m:",\%opts;
 $movedir="/archive/books/fbdoubles/";
-$movedir=$opts{m} if $opts{m};
+$movedir=$opts{m} if ($opts{m} && -d $opts{m});
 $workdir="/archive/books/fb/";
 $workdir=$opts{d} if $opts{d};
 
 sub rmbook($$) {
     my $reason=$_[0];
     my $file=$_[1];
-    print $reason."\nrm ".$file."\n\n" unless $opts{q};
-    if($opts{m}){
+    print $reason." rm ".$file."\n\n" unless $opts{q};
+    if(exists $opts{m}){
 	move($file, $movedir);
-    } elsif($opts{y}){
+    } elsif(exists $opts{y}){
 	unlink $file;
     } 
 };
@@ -84,8 +84,8 @@ while (<BOOKLIST>)
     if ($@) { # XML parsing failed
 	$brokenbody=1;
 	$@=~s|at /usr/.*$||;
-	print "ERROR>$zipfile:".$@ unless $opts{q}; 
-	print "trying to process header only.." unless $opts{q};
+	print "\nERROR>$zipfile:".$@ unless $opts{q}; 
+#	print "trying to process header only.." unless $opts{q};
 	$fb=~s|<body.*</body>|<body></body>|s;
 	$fb=~s|<binary .*</binary>||gs;
 	$xml = eval{ XMLin($fb, NoAttr=>1,SuppressEmpty=>'')};
@@ -133,6 +133,12 @@ while (<BOOKLIST>)
 	    print "LibRusEc kit: duplicate ID, skip...\n" unless $opts{q};
 	    next;
 	};
+#librusec kit: возможны неуникальные id
+	if ( $id=~/20[01]\d{11}$/ &&
+	     $booktitle ne $lib{$id}->{booktitle}){
+	    print "LibRusEc kit(?): duplicate ID, skip...\n" unless $opts{q};
+	    next;
+	};
 #короткий id. вероятно, неуникальный
 	if(length($id)<10 &&
 	   $booktitle ne $lib{$id}->{booktitle}){
@@ -173,6 +179,18 @@ while (<BOOKLIST>)
 	    rmbook("Librusec:",$lib{$id}->{file});
 	    goto ENDOFRULES;
 	};
+# если файл лежит в корне библиотеки - значит у него проблемы с
+# описанием, ибо нормальные файлы дОлжно раскидывать в подкаталоги.
+	if($zipfile=~/$workdir\_[^\/]+$/ &&
+	   $lib{$id}->{file}!~/$workdir\_[^\/]+$/) {
+	    rmbook("File in root:",$zipfile);
+	    next;
+	}
+	if($zipfile!~/$workdir\_[^\/]+$/ &&
+	   $lib{$id}->{file}=~/$workdir\_[^\/]+$/) {
+	    rmbook("File in root:",$lib{$id}->{file});
+	    next;
+	}
 
 # нестандартные символы в заголовке - нафигнафиг
 	if($zipfile=~/[^[:graph:]]/ &&
